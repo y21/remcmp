@@ -1,0 +1,2 @@
+[workspace]
+members = ["remcmp_client", "remcmp_server", "remcmp_shared"]
