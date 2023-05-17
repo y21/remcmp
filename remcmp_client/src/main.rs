@@ -1,13 +1,13 @@
-use std::env;
-use std::net::SocketAddr;
 use std::process::Output;
 
 use anyhow::bail;
+use anyhow::ensure;
 use anyhow::Context;
+use config::Config;
 use remcmp_shared::BuildJob;
 use remcmp_shared::BuildResponse;
 use remcmp_shared::ConnectPacket;
-use remcmp_shared::Job;
+use remcmp_shared::Connection;
 use remcmp_shared::JobKind;
 use tokio::fs;
 use tokio::net::TcpStream;
@@ -15,97 +15,36 @@ use tokio::process::Command;
 use tracing::debug;
 use tracing::info;
 
-struct Config {
-    host: SocketAddr,
-    output_path: String,
-    auth: Option<String>,
-}
+use crate::util::matches_checksum;
 
-async fn connect(conf: &Config) -> anyhow::Result<TcpStream> {
-    let mut conn = TcpStream::connect(conf.host)
-        .await
-        .context("Failed to connect to host")?;
-
-    info!("Connected to host. Sending connect packet");
-
-    remcmp_shared::send(
-        &mut conn,
-        ConnectPacket {
-            auth: conf.auth.clone(),
-        },
-    )
-    .await
-    .context("Failed to send connect packet")?;
-
-    Ok(conn)
-}
-
-async fn git_diff() -> anyhow::Result<String> {
-    let Output { status, stdout, .. } = Command::new("git")
-        .arg("diff")
-        .output()
-        .await
-        .context("Failed to run `git diff`")?;
-
-    debug!(%status);
-    String::from_utf8(stdout).context("Invalid UTF8 in diff")
-}
+mod config;
+mod util;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let host: SocketAddr = env::var("REMCMP_HOST")
-        .map(|h| h.parse())
-        .context("Failed to read `REMCMP_HOST` env variable")?
-        .context("Failed to parse `REMCMP_HOST` env variable")?;
+    let config = Config::create().context("Failed to create config")?;
 
-    let output_path =
-        env::var("REMCMP_OUTPUT_BIN").context("Missing `REMCMP_OUTPUT_BIN` env variable")?;
-
-    let auth = env::var("REMCMP_AUTH").ok();
-
-    debug!(?auth);
-
-    let config = Config {
-        auth,
-        host,
-        output_path,
-    };
-
-    let connect_fut = connect(&config);
-    let diff_fut = git_diff();
-
-    let (mut conn, diff) = tokio::try_join!(connect_fut, diff_fut)?;
+    let (mut conn, diff) = tokio::try_join!(connect(&config), git_diff())?;
 
     debug!("Sending diff");
 
-    remcmp_shared::send(
-        &mut conn,
-        Job {
-            kind: JobKind::Build(BuildJob { diff }),
-        },
-    )
-    .await
-    .context("Failed to send diff packet")?;
+    conn.send_build_job(BuildJob { diff })
+        .await
+        .context("Failed to send diff packet")?;
 
-    let response = remcmp_shared::parse::<Job>(&mut conn)
+    let response = conn
+        .recv_job()
         .await
         .context("Failed to receive response")?;
 
     match response.kind {
         JobKind::BuildResponse(BuildResponse { checksum, binary }) => {
             info!("Received build response");
-            let local_checksum = crc32fast::hash(&binary);
-            if checksum != local_checksum {
-                bail!(
-                    "Checksum mismatch! {} (recv) != {} (local)",
-                    checksum,
-                    local_checksum
-                );
-            }
+            ensure!(matches_checksum(checksum, &binary), "Checksum mismatch!");
 
-            info!("Checksum matches. Writing binary to {}", config.output_path);
+            info!("Writing binary to {}", config.output_path);
             fs::write(&config.output_path, binary).await?;
 
             Command::new("chmod")
@@ -118,4 +57,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn connect(conf: &Config) -> anyhow::Result<Connection> {
+    let mut conn: Connection = TcpStream::connect(conf.host)
+        .await
+        .context("Failed to connect to host")?
+        .into();
+
+    info!("Connected to host. Sending connect packet");
+
+    conn.send_connect_packet(ConnectPacket {
+        auth: conf.auth.clone(),
+    })
+    .await
+    .context("Failed to send connect packet")?;
+
+    Ok(conn)
+}
+
+async fn git_diff() -> anyhow::Result<Vec<u8>> {
+    let Output { status, stdout, .. } = Command::new("git")
+        .arg("diff")
+        .output()
+        .await
+        .context("Failed to run `git diff`")?;
+
+    debug!(%status);
+    Ok(stdout)
 }

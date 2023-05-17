@@ -224,6 +224,7 @@ dependencies = [
  "bincode",
  "serde",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
